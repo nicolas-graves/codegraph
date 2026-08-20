@@ -708,9 +708,37 @@ recognizes. Map them with an optional **`codegraph.json`** at your project root:
 Each value is a supported language id. The mappings merge on top of the built-in
 defaults and win on conflict, so you can also re-point a built-in (e.g.
 `".h": "cpp"`). Commit the file to share the mapping with your team. A typo'd
-language or a malformed file is warned about and skipped — it never breaks
-indexing — and a project with no `codegraph.json` behaves exactly as before.
+language is a configuration error, while malformed non-plugin configuration is
+warned about and skipped. A project with no `codegraph.json` behaves exactly as before.
 Re-index (`codegraph index`) after adding or changing mappings.
+
+### Trusted plugins
+
+CodeGraph can load external languages and framework resolvers from explicitly
+listed project dependencies. It never auto-discovers local or global plugins:
+
+```json
+{
+  "plugins": ["@example/codegraph-guix", "./tools/local-codegraph-plugin"],
+  "extensions": { ".scm": "scheme" }
+}
+```
+
+Version 1 plugins are CommonJS modules exporting `apiVersion: 1`, a unique
+`name`, and optional `languages` and `frameworks`. A language supplies a unique
+id, extensions, a tree-sitter WASM path relative to the plugin entry point, and
+a `LanguageExtractor`. Import the public TypeScript contracts from
+`@colbymchenry/codegraph` (`CodeGraphPlugin`, `LanguagePlugin`, and
+`LanguageExtractor`). External languages always use the portable WASM path;
+they are never sent to the native kernel.
+
+Plugins are trusted code: their JavaScript executes without a sandbox in the
+CodeGraph main process and parse workers. Missing packages, incompatible API
+versions, invalid grammars, malformed extractors, duplicate ids, and extension
+collisions abort indexing with a configuration error. Only the project's
+explicit `extensions` map may reassign an extension. Reopen the project after
+changing its plugin list; adding, removing, or upgrading a plugin marks the
+index stale and requires re-indexing.
 
 ## Telemetry
 

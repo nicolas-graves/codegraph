@@ -9,9 +9,9 @@
 import * as path from 'path';
 import * as fsp from 'fs/promises';
 import { Parser, Language as WasmLanguage } from 'web-tree-sitter';
-import { Language } from '../types';
+import { Language, BuiltInLanguage } from '../types';
 
-export type GrammarLanguage = Exclude<Language, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
+export type GrammarLanguage = Exclude<BuiltInLanguage, 'svelte' | 'vue' | 'astro' | 'liquid' | 'razor' | 'yaml' | 'twig' | 'xml' | 'properties' | 'unknown'>;
 
 /**
  * WASM filename map — maps each language to its .wasm grammar file
@@ -230,8 +230,8 @@ export function isPlayRoutesFile(filePath: string): boolean {
 /**
  * Caches for loaded grammars and parsers
  */
-const parserCache = new Map<Language, Parser>();
-const languageCache = new Map<Language, WasmLanguage>();
+const parserCache = new Map<string, Parser>();
+const languageCache = new Map<string, WasmLanguage>();
 const unavailableGrammarErrors = new Map<Language, string>();
 
 let parserInitialized = false;
@@ -377,7 +377,7 @@ function expandGrammarLanguages(languages: Language[]): Language[] {
  * can't be read here is simply omitted, and the worker falls back to its own
  * disk load (which surfaces the real error/warning path).
  */
-export async function readGrammarWasmBytes(languages: Language[]): Promise<Record<string, Uint8Array>> {
+export async function readGrammarWasmBytes(languages: Language[], externalGrammarPaths: Record<string, string> = {}): Promise<Record<string, Uint8Array>> {
   const out: Record<string, Uint8Array> = {};
   const toRead = [...new Set(expandGrammarLanguages(languages))].filter(
     (lang): lang is GrammarLanguage => lang in WASM_GRAMMAR_FILES
@@ -388,6 +388,10 @@ export async function readGrammarWasmBytes(languages: Language[]): Promise<Recor
     } catch {
       // fall through — the worker's own load reports the failure
     }
+  }
+  for (const lang of languages) {
+    const grammar = externalGrammarPaths[lang];
+    if (grammar) out[lang] = await fsp.readFile(grammar);
   }
   return out;
 }
@@ -401,7 +405,7 @@ export async function readGrammarWasmBytes(languages: Language[]): Promise<Recor
  * {@link readGrammarWasmBytes}, forwarded through the parse pool); when a
  * language's bytes are present they're loaded from memory instead of disk.
  */
-export async function loadGrammarsForLanguages(languages: Language[], wasmBytes?: Record<string, Uint8Array>): Promise<void> {
+export async function loadGrammarsForLanguages(languages: Language[], wasmBytes?: Record<string, Uint8Array>, externalGrammarPaths: Record<string, string> = {}): Promise<void> {
   if (!parserInitialized) {
     await initGrammars();
   }
@@ -429,6 +433,20 @@ export async function loadGrammarsForLanguages(languages: Language[], wasmBytes?
       unavailableGrammarErrors.set(lang, message);
     }
   }
+  for (const lang of [...new Set(languages)]) {
+    const grammarPath = externalGrammarPaths[lang];
+    if (!grammarPath) continue;
+    const cacheKey = `${lang}\0${grammarPath}`;
+    if (languageCache.has(cacheKey)) continue;
+    try {
+      const language = await WasmLanguage.load(wasmBytes?.[lang] ?? grammarPath);
+      languageCache.set(cacheKey, language);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      unavailableGrammarErrors.set(lang, message);
+      throw new Error(`Failed to load plugin grammar for "${lang}": ${message}`);
+    }
+  }
 }
 
 /**
@@ -451,19 +469,20 @@ export function isGrammarsInitialized(): boolean {
  * Get a parser for the specified language.
  * Returns synchronously from pre-loaded cache.
  */
-export function getParser(language: Language): Parser | null {
-  if (parserCache.has(language)) {
-    return parserCache.get(language)!;
+export function getParser(language: Language, externalGrammarPath?: string): Parser | null {
+  const cacheKey = externalGrammarPath ? `${language}\0${externalGrammarPath}` : language;
+  if (parserCache.has(cacheKey)) {
+    return parserCache.get(cacheKey)!;
   }
 
-  const lang = languageCache.get(language);
+  const lang = languageCache.get(cacheKey);
   if (!lang) {
     return null;
   }
 
   const parser = new Parser();
   parser.setLanguage(lang);
-  parserCache.set(language, parser);
+  parserCache.set(cacheKey, parser);
   return parser;
 }
 

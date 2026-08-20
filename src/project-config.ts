@@ -25,13 +25,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { Language } from './types';
-import { isLanguageSupported } from './extraction/grammars';
 import { logWarn } from './errors';
 
 /** Filename of the project-scoped config, resolved relative to the project root. */
 export const PROJECT_CONFIG_FILENAME = 'codegraph.json';
 
 export interface ProjectConfig {
+  /** Explicit trusted NPM packages or project-relative CommonJS plugin paths. */
+  plugins?: string[];
   /** Map of custom file extension (`.foo`) to a supported language id. */
   extensions?: Record<string, string>;
   /**
@@ -86,6 +87,7 @@ export interface ProjectConfig {
 
 /** Parsed, validated view of a project's `codegraph.json`. */
 interface ParsedConfig {
+  plugins: string[];
   extensions: Record<string, Language>;
   includeIgnored: string[];
   exclude: string[];
@@ -109,6 +111,7 @@ const cache = new Map<string, CacheEntry>();
 /** Shared frozen empties so the no-config path allocates nothing. */
 const EMPTY_EXTENSIONS: Record<string, Language> = Object.freeze({});
 const EMPTY_CONFIG: ParsedConfig = Object.freeze({
+  plugins: Object.freeze([]) as unknown as string[],
   extensions: EMPTY_EXTENSIONS,
   includeIgnored: Object.freeze([]) as unknown as string[],
   exclude: Object.freeze([]) as unknown as string[],
@@ -162,13 +165,14 @@ function parseConfig(file: string): ParsedConfig {
 
   if (!parsed || typeof parsed !== 'object') return EMPTY_CONFIG;
 
+  const plugins = extractPlugins(parsed, file);
   const extensions = extractExtensions(parsed, file);
   const includeIgnored = extractIncludeIgnored(parsed, file);
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
   if (
-    extensions === EMPTY_EXTENSIONS &&
+    plugins.length === 0 && extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
     include.length === 0 &&
@@ -176,12 +180,28 @@ function parseConfig(file: string): ParsedConfig {
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize };
+  return { plugins, extensions, includeIgnored, exclude, include, deprioritize };
+}
+
+function extractPlugins(parsed: object, file: string): string[] {
+  const raw = (parsed as ProjectConfig).plugins;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw) || raw.some((x) => typeof x !== 'string' || !x.trim())) {
+    throw new Error(`Invalid ${PROJECT_CONFIG_FILENAME}: "plugins" must be an array of non-empty package names or relative paths (${file})`);
+  }
+  return raw.map((x) => x.trim());
 }
 
 /**
  * Validate the `extensions` map. Every failure mode degrades to "no overrides
  * from this entry" — a bad value or a typo'd language never throws.
+ *
+ * Does NOT validate that the target is a *known* language: a project can map
+ * an extension to a language a loaded plugin provides, which this function
+ * (no registry in scope) can't distinguish from a typo. That check happens
+ * where a registry is available — `PluginRegistry.extensionMap()` — which
+ * warns and drops any entry naming a language neither built in nor plugin-
+ * registered.
  */
 function extractExtensions(parsed: object, file: string): Record<string, Language> {
   const exts = (parsed as ProjectConfig).extensions;
@@ -194,11 +214,11 @@ function extractExtensions(parsed: object, file: string): Record<string, Languag
       logWarn(`Ignoring extension mapping in ${PROJECT_CONFIG_FILENAME}: "${rawKey}" is not a valid file extension`, { file });
       continue;
     }
-    if (typeof rawVal !== 'string' || !isLanguageSupported(rawVal as Language)) {
-      logWarn(`Ignoring extension "${rawKey}" in ${PROJECT_CONFIG_FILENAME}: "${String(rawVal)}" is not a supported language`, { file });
+    if (typeof rawVal !== 'string' || !rawVal.trim()) {
+      logWarn(`Ignoring extension "${rawKey}" in ${PROJECT_CONFIG_FILENAME}: language must be a non-empty string`, { file });
       continue;
     }
-    out[key] = rawVal as Language;
+    out[key] = rawVal.trim() as Language;
   }
 
   return Object.keys(out).length > 0 ? out : EMPTY_EXTENSIONS;
@@ -341,6 +361,11 @@ function loadParsedConfig(rootDir: string): ParsedConfig {
  */
 export function loadExtensionOverrides(rootDir: string): Record<string, Language> {
   return loadParsedConfig(rootDir).extensions;
+}
+
+/** Explicit plugin specifiers in declaration order. Plugin errors are fatal by design. */
+export function loadPluginSpecifiers(rootDir: string): string[] {
+  return [...loadParsedConfig(rootDir).plugins];
 }
 
 /**

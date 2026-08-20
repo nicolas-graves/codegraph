@@ -70,9 +70,9 @@ describe('custom extension → language mapping (#906)', () => {
       expect(loadExtensionOverrides(dir)).toEqual({ '.foo': 'lua', '.bar': 'go' });
     });
 
-    it('skips entries whose target is not a supported language', () => {
+    it('keeps entries whose target is not a supported language — that check is deferred to the plugin-aware registry, which may know the language', () => {
       writeConfig({ extensions: { '.foo': 'typescript', '.bad': 'pyhton', '.x': 'unknown' } });
-      expect(loadExtensionOverrides(dir)).toEqual({ '.foo': 'typescript' });
+      expect(loadExtensionOverrides(dir)).toEqual({ '.foo': 'typescript', '.bad': 'pyhton', '.x': 'unknown' });
     });
 
     it('skips multi-part and otherwise unusable extension keys', () => {

@@ -32,9 +32,9 @@ import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
 import ignore, { Ignore } from 'ignore';
-import { detectFrameworks } from '../resolution/frameworks';
 import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
+import { PluginRegistry } from '../plugins';
 
 /**
  * Number of files to read in parallel during indexing.
@@ -1207,10 +1207,11 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, over
  */
 export function scanDirectory(
   rootDir: string,
-  onProgress?: (current: number, file: string) => void
+  onProgress?: (current: number, file: string) => void,
+  extensionOverrides?: Record<string, Language>
 ): string[] {
   // Custom extension → language overrides from the project's codegraph.json.
-  const overrides = loadExtensionOverrides(rootDir);
+  const overrides = extensionOverrides ?? loadExtensionOverrides(rootDir);
 
   // Fast path: use git to get all visible files (respects .gitignore everywhere)
   const gitFiles = getGitVisibleFiles(rootDir);
@@ -1228,7 +1229,7 @@ export function scanDirectory(
   }
 
   // Fallback: walk filesystem for non-git projects
-  return scanDirectoryWalk(rootDir, onProgress);
+  return scanDirectoryWalk(rootDir, onProgress, overrides);
 }
 
 /**
@@ -1237,10 +1238,11 @@ export function scanDirectory(
  */
 export async function scanDirectoryAsync(
   rootDir: string,
-  onProgress?: (current: number, file: string) => void
+  onProgress?: (current: number, file: string) => void,
+  extensionOverrides?: Record<string, Language>
 ): Promise<string[]> {
   // Custom extension → language overrides from the project's codegraph.json.
-  const overrides = loadExtensionOverrides(rootDir);
+  const overrides = extensionOverrides ?? loadExtensionOverrides(rootDir);
 
   const gitFiles = getGitVisibleFiles(rootDir);
   if (gitFiles) {
@@ -1260,7 +1262,7 @@ export async function scanDirectoryAsync(
     return files;
   }
 
-  return scanDirectoryWalk(rootDir, onProgress);
+  return scanDirectoryWalk(rootDir, onProgress, overrides);
 }
 
 /**
@@ -1268,13 +1270,14 @@ export async function scanDirectoryAsync(
  */
 function scanDirectoryWalk(
   rootDir: string,
-  onProgress?: (current: number, file: string) => void
+  onProgress?: (current: number, file: string) => void,
+  extensionOverrides?: Record<string, Language>
 ): string[] {
   const files: string[] = [];
   let count = 0;
   const visitedDirs = new Set<string>();
   // Custom extension → language overrides from the project's codegraph.json.
-  const overrides = loadExtensionOverrides(rootDir);
+  const overrides = extensionOverrides ?? loadExtensionOverrides(rootDir);
 
   // A .gitignore matcher scoped to the directory that declared it. Patterns in
   // a nested .gitignore are relative to that directory, so we keep the dir
@@ -1449,7 +1452,7 @@ export class ExtractionOrchestrator {
    */
   private detectedFrameworkNames: string[] | null = null;
 
-  constructor(rootDir: string, queries: QueryBuilder) {
+  constructor(rootDir: string, queries: QueryBuilder, private registry: PluginRegistry = new PluginRegistry()) {
     this.rootDir = rootDir;
     this.queries = queries;
   }
@@ -1517,9 +1520,12 @@ export class ExtractionOrchestrator {
    */
   private ensureDetectedFrameworks(files?: string[]): string[] {
     if (this.detectedFrameworkNames !== null) return this.detectedFrameworkNames;
-    const fileList = files ?? scanDirectory(this.rootDir);
+    const overrides = this.registry.extensionMap(loadExtensionOverrides(this.rootDir));
+    const fileList = files ?? scanDirectory(this.rootDir, undefined, overrides);
     const context = this.buildDetectionContext(fileList);
-    this.detectedFrameworkNames = detectFrameworks(context).map((r) => r.name);
+    this.detectedFrameworkNames = this.registry.getFrameworks().filter((resolver) => {
+      try { return resolver.detect(context); } catch { return false; }
+    }).map((r) => r.name);
     return this.detectedFrameworkNames;
   }
 
@@ -1556,7 +1562,7 @@ export class ExtractionOrchestrator {
     // Custom extension → language overrides from the project's codegraph.json.
     // Threaded into language detection so custom-extension files load the right
     // grammar and store under the mapped language.
-    const overrides = loadExtensionOverrides(this.rootDir);
+    const overrides = this.registry.extensionMap(loadExtensionOverrides(this.rootDir));
 
     const log = verbose
       ? (msg: string) => { console.log(`[worker] ${msg}`); }
@@ -1580,7 +1586,7 @@ export class ExtractionOrchestrator {
         total: 0,
         currentFile: file,
       });
-    });
+    }, overrides);
     if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] scan: ${Date.now() - tScan}ms (${files.length} files)`);
 
     // A re-index over an existing DB skips unchanged-hash files at the store,
@@ -1654,7 +1660,13 @@ export class ExtractionOrchestrator {
       // worker, so spawns/respawns load grammars from memory instead of
       // re-reading them from disk (#1231: on an HDD, respawn re-reads amplify
       // the very I/O contention that caused the respawn).
-      const grammarBuffers = await readGrammarWasmBytes(neededLanguages);
+      const grammarBuffers = await readGrammarWasmBytes(neededLanguages, this.registry.grammarPaths());
+      // Validate external WASM in the main process before workers are spawned;
+      // a corrupt configured grammar is a fatal configuration error, not a
+      // worker-ready hang or a silently partial graph.
+      if (this.registry.plugins.length > 0) {
+        await loadGrammarsForLanguages(neededLanguages, grammarBuffers, this.registry.grammarPaths());
+      }
       pool = new ParseWorkerPool({
         languages: neededLanguages,
         size: poolSize,
@@ -1663,6 +1675,8 @@ export class ExtractionOrchestrator {
         parseTimeoutMs: PARSE_TIMEOUT_MS,
         log,
         grammarBuffers,
+        pluginSpecifiers: this.registry.plugins.map((p) => p.specifier),
+        projectRoot: this.rootDir,
       });
       log(`Parse worker pool: ${poolSize} worker(s)`);
       // Bulk index: every core will be needed — spawn the whole pool now so
@@ -1671,7 +1685,7 @@ export class ExtractionOrchestrator {
       pool.prewarm();
     } else {
       // In-process fallback: load grammars locally and parse on the main thread.
-      await loadGrammarsForLanguages(neededLanguages);
+      await loadGrammarsForLanguages(neededLanguages, undefined, this.registry.grammarPaths());
     }
 
     // Dedicated store writer thread (fresh DB only — see the parameter doc).
@@ -1702,7 +1716,7 @@ export class ExtractionOrchestrator {
      */
     const parseFile = (filePath: string, content: string): Promise<ExtractionResult> => {
       const language = detectLanguage(filePath, content, overrides);
-      if (!pool) return Promise.resolve(extractFromSource(filePath, content, language, frameworkNames));
+      if (!pool) return Promise.resolve(extractFromSource(filePath, content, language, frameworkNames, this.registry));
       return pool.requestParse({ filePath, content, language, frameworkNames });
     };
 
@@ -2252,7 +2266,7 @@ export class ExtractionOrchestrator {
       };
     }
 
-    const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir));
+    const language = detectLanguage(relativePath, content, this.registry.extensionMap(loadExtensionOverrides(this.rootDir)));
 
     // Check file size
     if (stats.size > MAX_FILE_SIZE) {
@@ -2821,13 +2835,13 @@ export class ExtractionOrchestrator {
 
     // Load only grammars needed for changed files
     if (filesToIndex.length > 0) {
-      const overrides = loadExtensionOverrides(this.rootDir);
+      const overrides = this.registry.extensionMap(loadExtensionOverrides(this.rootDir));
       const neededLanguages = [...new Set(filesToIndex.map((f) => detectLanguage(f, undefined, overrides)))];
       // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded
       if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
         neededLanguages.push('cpp');
       }
-      await loadGrammarsForLanguages(neededLanguages);
+      await loadGrammarsForLanguages(neededLanguages, undefined, this.registry.grammarPaths());
     }
 
     // Index changed files

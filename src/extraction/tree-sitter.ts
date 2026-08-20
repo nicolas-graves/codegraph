@@ -20,6 +20,7 @@ import { generateNodeId, getNodeText, getChildByField, getPrecedingDocstring } f
 import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandidate } from './function-ref';
 import { isGeneratedFile } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
+import type { PluginRegistry } from '../plugins';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs } from './languages/c-cpp';
 import { LiquidExtractor } from './liquid-extractor';
@@ -433,19 +434,21 @@ export class TreeSitterExtractor {
   // point (this instance is the wasm fallback for a kernel-deferred file) —
   // don't blank it a second time.
   private sourceIsPreParsed = false;
+  private registry?: PluginRegistry;
 
   constructor(
     filePath: string,
     source: string,
     language?: Language,
-    options?: { sourceIsPreParsed?: boolean }
+    options?: { sourceIsPreParsed?: boolean; registry?: PluginRegistry }
   ) {
     this.filePath = filePath;
     this.source = source;
     this.language = language || detectLanguage(filePath, source);
-    this.extractor = EXTRACTORS[this.language] || null;
+    this.extractor = options?.registry?.getExtractor(this.language) ?? EXTRACTORS[this.language] ?? null;
     this.fnRefSpec = FN_REF_SPECS[this.language];
     this.sourceIsPreParsed = options?.sourceIsPreParsed === true;
+    this.registry = options?.registry;
   }
 
   /**
@@ -454,7 +457,7 @@ export class TreeSitterExtractor {
   extract(): ExtractionResult {
     const startTime = Date.now();
 
-    if (!isLanguageSupported(this.language)) {
+    if (!(this.registry?.isLanguageSupported(this.language) ?? isLanguageSupported(this.language))) {
       return {
         nodes: [],
         edges: [],
@@ -471,7 +474,7 @@ export class TreeSitterExtractor {
       };
     }
 
-    const parser = getParser(this.language);
+    const parser = getParser(this.language, this.registry?.getLanguage(this.language)?.grammar);
     if (!parser) {
       return {
         nodes: [],
@@ -6685,7 +6688,8 @@ export function extractFromSource(
   filePath: string,
   source: string,
   language?: Language,
-  frameworkNames?: string[]
+  frameworkNames?: string[],
+  registry?: PluginRegistry
 ): ExtractionResult {
   const detectedLanguage = language || detectLanguage(filePath, source);
   const fileExtension = path.extname(filePath).toLowerCase();
@@ -6755,7 +6759,7 @@ export function extractFromSource(
         filePath,
         deferredPre ?? source,
         detectedLanguage,
-        { sourceIsPreParsed: deferredPre != null }
+        { sourceIsPreParsed: deferredPre != null, registry }
       );
       result = extractor.extract();
     }
@@ -6763,7 +6767,7 @@ export function extractFromSource(
 
   // Framework-specific extraction (routes, middleware, etc.)
   if (frameworkNames && frameworkNames.length > 0) {
-    const allResolvers = getAllFrameworkResolvers();
+    const allResolvers = registry?.getFrameworks() ?? getAllFrameworkResolvers();
     const applicable = getApplicableFrameworks(
       allResolvers.filter((r) => frameworkNames.includes(r.name)),
       detectedLanguage

@@ -39,6 +39,7 @@ import {
   IndexResult,
   SyncResult,
   extractFromSource,
+  detectLanguage,
   initGrammars,
 } from './extraction';
 import {
@@ -59,6 +60,8 @@ import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
+import { loadExtensionOverrides, loadPluginSpecifiers } from './project-config';
+import { loadPluginRegistry, PluginRegistry } from './plugins';
 
 // Re-export types for consumers
 export * from './types';
@@ -76,6 +79,9 @@ export {
 } from './directory';
 export { IndexProgress, IndexResult, SyncResult } from './extraction';
 export { detectLanguage, isLanguageSupported, isGrammarLoaded, getSupportedLanguages, initGrammars, loadGrammarsForLanguages, loadAllGrammars } from './extraction';
+export { PluginRegistry, PluginConfigurationError, loadPluginRegistry } from './plugins';
+export type { CodeGraphPlugin, LanguagePlugin } from './plugins';
+export type { LanguageExtractor } from './extraction/tree-sitter-types';
 export { ResolutionResult } from './resolution';
 export {
   CodeGraphError,
@@ -150,6 +156,7 @@ export class CodeGraph {
   private graphManager!: GraphQueryManager;
   private traverser!: GraphTraverser;
   private contextBuilder!: ContextBuilder;
+  private readonly pluginRegistry: PluginRegistry;
 
   // Mutex for preventing concurrent indexing operations (in-process)
   private indexMutex = new Mutex();
@@ -168,6 +175,7 @@ export class CodeGraph {
     this.db = db;
     this.queries = queries;
     this.projectRoot = projectRoot;
+    this.pluginRegistry = loadPluginRegistry(projectRoot, loadPluginSpecifiers(projectRoot));
     this.fileLock = new FileLock(
       path.join(getCodeGraphDir(projectRoot), 'codegraph.lock')
     );
@@ -221,8 +229,8 @@ export class CodeGraph {
       }
     });
 
-    this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
-    this.resolver = createResolver(this.projectRoot, this.queries);
+    this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries, this.pluginRegistry);
+    this.resolver = createResolver(this.projectRoot, this.queries, this.pluginRegistry.getFrameworks());
     this.graphManager = new GraphQueryManager(this.queries);
     this.traverser = new GraphTraverser(this.queries);
     this.contextBuilder = createContextBuilder(
@@ -691,6 +699,7 @@ export class CodeGraph {
           try {
             this.queries.setMetadata('indexed_with_version', CodeGraphPackageVersion);
             this.queries.setMetadata('indexed_with_extraction_version', String(EXTRACTION_VERSION));
+            this.queries.setMetadata('indexed_with_plugin_fingerprint', this.pluginRegistry.fingerprint());
           } catch { /* metadata is advisory — never fail an index over it */ }
         }
 
@@ -1192,14 +1201,17 @@ export class CodeGraph {
   isIndexStale(): boolean {
     if (this.queries.getLastIndexedAt() == null) return false;
     const { extractionVersion } = this.getIndexBuildInfo();
-    return extractionVersion == null || extractionVersion < EXTRACTION_VERSION;
+    const pluginFingerprint = this.queries.getMetadata('indexed_with_plugin_fingerprint');
+    return extractionVersion == null || extractionVersion < EXTRACTION_VERSION || pluginFingerprint !== this.pluginRegistry.fingerprint();
   }
 
   /**
    * Extract nodes and edges from source code (without storing)
    */
   extractFromSource(filePath: string, source: string): ExtractionResult {
-    return extractFromSource(filePath, source);
+    const overrides = this.pluginRegistry.extensionMap(loadExtensionOverrides(this.projectRoot));
+    const language = detectLanguage(filePath, source, overrides);
+    return extractFromSource(filePath, source, language, undefined, this.pluginRegistry);
   }
 
   // ===========================================================================

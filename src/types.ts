@@ -120,7 +120,9 @@ export const LANGUAGES = [
   'unknown',
 ] as const;
 
-export type Language = (typeof LANGUAGES)[number];
+export type BuiltInLanguage = (typeof LANGUAGES)[number];
+/** A built-in id or a language registered by a trusted project plugin. */
+export type Language = BuiltInLanguage | (string & {});
 
 // =============================================================================
 // Core Graph Types

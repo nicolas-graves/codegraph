@@ -19,6 +19,7 @@ import { detectLanguage, loadGrammarsForLanguages, resetParser } from './grammar
 import { tryKernelExtractRaw } from './kernel';
 import { getAllFrameworkResolvers, getApplicableFrameworks } from '../resolution/frameworks';
 import type { Language, ExtractionResult } from '../types';
+import { loadPluginRegistry, PluginRegistry } from '../plugins';
 
 // Emscripten prints `Aborted()` (and a follow-up RuntimeError diag
 // line) directly to stderr when WASM aborts — before the JS catch
@@ -64,12 +65,14 @@ import type { Language, ExtractionResult } from '../types';
 
 const PARSER_RESET_INTERVAL = 5000;
 const parseCounts = new Map<Language, number>();
+let pluginRegistry: PluginRegistry | undefined;
 
-parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; language?: Language; grammarBuffers?: Record<string, Uint8Array> }) => {
+parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: string; content?: string; languages?: Language[]; frameworkNames?: string[]; language?: Language; grammarBuffers?: Record<string, Uint8Array>; pluginSpecifiers?: string[]; projectRoot?: string }) => {
   if (msg.type === 'load-grammars') {
     // Grammar WASM bytes pre-read by the main thread (when provided) make this
     // a memory load instead of a per-spawn disk read — see issue #1231.
-    await loadGrammarsForLanguages(msg.languages!, msg.grammarBuffers);
+    pluginRegistry = msg.projectRoot ? loadPluginRegistry(msg.projectRoot, msg.pluginSpecifiers ?? []) : undefined;
+    await loadGrammarsForLanguages(msg.languages!, msg.grammarBuffers, pluginRegistry?.grammarPaths());
     parentPort!.postMessage({ type: 'grammars-loaded' });
   } else if (msg.type === 'parse') {
     const { id, filePath, content, frameworkNames } = msg;
@@ -93,7 +96,7 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
       const frameworksNeedDecode =
         frameworkNames && frameworkNames.length > 0
           ? getApplicableFrameworks(
-              getAllFrameworkResolvers().filter((r) => frameworkNames.includes(r.name)),
+              (pluginRegistry?.getFrameworks() ?? getAllFrameworkResolvers()).filter((r) => frameworkNames.includes(r.name)),
               language
             ).some((fw) => !!fw.extract)
           : false;
@@ -111,7 +114,7 @@ parentPort!.on('message', async (msg: { type: string; id?: number; filePath?: st
           };
         }
       }
-      result ??= extractFromSource(filePath!, content!, language, frameworkNames);
+      result ??= extractFromSource(filePath!, content!, language, frameworkNames, pluginRegistry);
 
       // Periodic parser reset to reclaim WASM heap memory
       const count = (parseCounts.get(language) ?? 0) + 1;

@@ -280,7 +280,7 @@ export class ReferenceResolver {
   // Monorepo workspace member packages. Same lazy/immutable convention.
   private workspacePackages: WorkspacePackages | null | undefined = undefined;
 
-  constructor(projectRoot: string, queries: QueryBuilder) {
+  constructor(projectRoot: string, queries: QueryBuilder, private registeredFrameworks?: FrameworkResolver[]) {
     this.projectRoot = projectRoot;
     this.queries = queries;
 
@@ -307,7 +307,9 @@ export class ReferenceResolver {
    * Initialize the resolver (detect frameworks, etc.)
    */
   initialize(): void {
-    this.frameworks = detectFrameworks(this.context);
+    this.frameworks = this.registeredFrameworks
+      ? this.registeredFrameworks.filter((resolver) => { try { return resolver.detect(this.context); } catch { return false; } })
+      : detectFrameworks(this.context);
     this.clearCaches();
   }
 
@@ -2448,8 +2450,8 @@ export class ReferenceResolver {
 /**
  * Create a reference resolver instance
  */
-export function createResolver(projectRoot: string, queries: QueryBuilder): ReferenceResolver {
-  const resolver = new ReferenceResolver(projectRoot, queries);
+export function createResolver(projectRoot: string, queries: QueryBuilder, frameworks?: FrameworkResolver[]): ReferenceResolver {
+  const resolver = new ReferenceResolver(projectRoot, queries, frameworks);
   resolver.initialize();
   return resolver;
 }
