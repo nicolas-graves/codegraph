@@ -25,6 +25,8 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixes
 
+- A trusted plugin's language (an external grammar registered via `codegraph.json`'s `plugins` list) now survives `codegraph sync` and `codegraph status`. Previously, files in a plugin-only language indexed fine on the first `codegraph init`/`index`, but any later `sync` — including the one the file watcher runs on every save — silently dropped them from the index as if they'd been deleted, and editing one of those files stopped updating the graph at all.
+
 - Indexing no longer hangs on a Swift Vapor project containing a call with a long argument list. A single `.get(...)`-style call with many labeled arguments and no `use:` handler — the shape generated request builders produce — could stall `codegraph index`, `codegraph sync`, and the MCP server indefinitely. Route detection now handles such files in milliseconds, and every previously-recognized route shape still parses exactly as before. Thanks @maxmilian. (#1544) (Swift)
 
 - `codegraph status` now sees new files inside brand-new directories. Git reports an entirely-untracked directory as a single collapsed entry, so source files created there — a freshly scaffolded `frontend/`, for example — were missing from the pending-changes report, which could claim everything was up to date while those files had not yet been indexed. Thanks @maxmilian. (#1213)

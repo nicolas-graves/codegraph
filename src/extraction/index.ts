@@ -26,7 +26,7 @@ import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
-import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes } from './grammars';
+import { detectLanguage, isSourceFile, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes } from './grammars';
 import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
@@ -2288,8 +2288,11 @@ export class ExtractionOrchestrator {
       return result;
     }
 
-    // Detect language (honoring the project's codegraph.json extension overrides)
-    if (!isLanguageSupported(language)) {
+    // Detect language (honoring the project's codegraph.json extension overrides).
+    // Registry-aware, not the bare grammars.ts helper: a plugin-only language
+    // (e.g. an external Scheme plugin) isn't in the built-in LANGUAGES set, so
+    // the bare check silently no-ops every incremental re-index of its files.
+    if (!this.registry.isLanguageSupported(language)) {
       return {
         nodes: [],
         edges: [],
@@ -2303,7 +2306,7 @@ export class ExtractionOrchestrator {
     // otherwise detect on the spot so single-file re-index paths still emit
     // route nodes / middleware / etc.
     const frameworkNames = this.ensureDetectedFrameworks();
-    const result = extractFromSource(relativePath, content, language, frameworkNames);
+    const result = extractFromSource(relativePath, content, language, frameworkNames, this.registry);
 
     // Store in database
     await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder());
@@ -2695,6 +2698,13 @@ export class ExtractionOrchestrator {
     });
 
     const filesToIndex: string[] = [];
+    // Custom extension → language overrides, including plugin-registered
+    // extensions — threaded into the scan below so a plugin language's files
+    // (e.g. `.scm` from an external Scheme plugin) are recognized as source
+    // files here exactly as they are during indexAll (#1524). Without this,
+    // sync's scan silently disagrees with indexAll's and treats every
+    // plugin-language file as deleted from disk.
+    const overrides = this.registry.extensionMap(loadExtensionOverrides(this.rootDir));
     // === Filesystem reconcile (git-independent) ===
     // The source of truth for "what changed" is the filesystem vs the indexed
     // state — never git. We enumerate the current source files and reconcile
@@ -2723,7 +2733,7 @@ export class ExtractionOrchestrator {
       filesChecked = unique.length;
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scoped: ${Date.now() - tSyncScan}ms (${unique.length} paths, ${trackedFiles.length} tracked)`);
     } else {
-      currentFiles = await scanDirectoryAsync(this.rootDir);
+      currentFiles = await scanDirectoryAsync(this.rootDir, undefined, overrides);
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scan: ${Date.now() - tSyncScan}ms (${currentFiles.length} files)`);
       filesChecked = currentFiles.length;
 
@@ -2835,7 +2845,6 @@ export class ExtractionOrchestrator {
 
     // Load only grammars needed for changed files
     if (filesToIndex.length > 0) {
-      const overrides = this.registry.extensionMap(loadExtensionOverrides(this.rootDir));
       const neededLanguages = [...new Set(filesToIndex.map((f) => detectLanguage(f, undefined, overrides)))];
       // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded
       if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
@@ -2939,7 +2948,11 @@ export class ExtractionOrchestrator {
     }
 
     // === Fallback: full scan (non-git project or git failure) ===
-    const currentFiles = new Set(scanDirectory(this.rootDir));
+    // Plugin-aware overrides, same as sync()/indexAll — otherwise a
+    // plugin-language file scans as "not a source file" here and reports as
+    // removed on every `status`/`getChangedFiles` call after the first index.
+    const overrides = this.registry.extensionMap(loadExtensionOverrides(this.rootDir));
+    const currentFiles = new Set(scanDirectory(this.rootDir, undefined, overrides));
     const trackedFiles = this.queries.getAllFiles();
 
     // Build Map for O(1) lookups

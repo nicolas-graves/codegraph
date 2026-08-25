@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { loadPluginRegistry, PluginConfigurationError } from '../src/plugins';
+import CodeGraph from '../src/index';
 
 const dirs: string[] = [];
 function fixture(body: string, grammar = true): string {
@@ -57,5 +58,81 @@ describe('external plugin registry', () => {
     expect(rb.detectLanguage('x.scm')).toBeUndefined();
     expect(ra.extensionMap({ '.scm': 'javascript' })['.scm']).toBe('javascript');
     expect(ra.extensionMap({ '.foo': 'missing-language' })['.foo']).toBeUndefined();
+  });
+});
+
+describe('external plugin end-to-end indexing (#1552)', () => {
+  // A real vendored grammar + a real extractor (reusing python's, since a
+  // plugin-only language exercises the exact same extraction path) — unlike
+  // the registry-only tests above, this drives full CodeGraph.indexAll /
+  // sync / getChangedFiles so it catches bugs where the plugin registry
+  // loads fine but individual pipeline stages fall back to the built-in,
+  // non-registry-aware helpers and silently treat the plugin language as
+  // unsupported.
+  const pyWasm = require.resolve('tree-sitter-wasms/out/tree-sitter-python.wasm');
+  // Same shape as src/extraction/languages/python.ts's pythonExtractor, inlined
+  // as a plain object literal so the plugin fixture has no dependency on dist/.
+  const pyExtractorLiteral = `{
+    functionTypes: ['function_definition'], classTypes: ['class_definition'],
+    methodTypes: ['function_definition'], interfaceTypes: [], structTypes: [],
+    enumTypes: [], typeAliasTypes: [], importTypes: ['import_statement', 'import_from_statement'],
+    callTypes: ['call'], variableTypes: ['assignment'],
+    nameField: 'name', bodyField: 'body', paramsField: 'parameters',
+  }`;
+
+  function project(): string {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-plugin-e2e-'));
+    dirs.push(root);
+    fs.writeFileSync(
+      path.join(root, 'plugin.cjs'),
+      `module.exports = { apiVersion: 1, name: 'py-plugin-test', languages: [{
+        id: 'pyplugintest', extensions: ['.pyplug'], grammar: ${JSON.stringify(pyWasm)},
+        extractor: ${pyExtractorLiteral},
+      }] };`
+    );
+    fs.writeFileSync(path.join(root, 'codegraph.json'), JSON.stringify({ plugins: ['./plugin.cjs'] }));
+    fs.writeFileSync(path.join(root, 'greet.pyplug'), `def greet(name):\n    return helper(name)\n\ndef helper(name):\n    return "hi " + name\n`);
+    return root;
+  }
+
+  it('indexes a plugin-only language and keeps it stable across sync (regression: sync/getChangedFiles used to drop it as removed)', async () => {
+    const root = project();
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      const status1 = cg.getChangedFiles();
+      expect(status1.removed).toHaveLength(0);
+      expect(status1.added).toHaveLength(0);
+      expect(status1.modified).toHaveLength(0);
+
+      const sync1 = await cg.sync();
+      expect(sync1.filesRemoved).toBe(0);
+      expect(sync1.filesAdded).toBe(0);
+      expect(sync1.filesModified).toBe(0);
+
+      const found = cg.searchNodes('helper');
+      expect(found.some((r) => r.node.name === 'helper')).toBe(true);
+    } finally {
+      cg.destroy();
+    }
+  });
+
+  it('re-extracts a plugin-language file on edit instead of silently no-oping (regression: indexFileWithContent used the non-registry-aware isLanguageSupported/extractFromSource)', async () => {
+    const root = project();
+    const cg = await CodeGraph.init(root, { index: true });
+    try {
+      fs.appendFileSync(path.join(root, 'greet.pyplug'), `\ndef farewell(name):\n    return "bye " + name\n`);
+      const sync = await cg.sync();
+      expect(sync.filesModified).toBe(1);
+      expect(sync.nodesUpdated).toBeGreaterThan(0);
+
+      const found = cg.searchNodes('farewell');
+      expect(found.some((r) => r.node.name === 'farewell')).toBe(true);
+
+      // A second sync must be a true no-op, not perpetually "modified".
+      const sync2 = await cg.sync();
+      expect(sync2.filesModified).toBe(0);
+    } finally {
+      cg.destroy();
+    }
   });
 });
