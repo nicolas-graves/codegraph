@@ -106,6 +106,20 @@ describe('auto-discovered plugins (GUIX_CODEGRAPH_PLUGINS)', () => {
     expect(specifiers).toHaveLength(2);
   });
 
+  it('collapses the same underlying plugin reached via two different profile directories (regression: a Guix profile whose etc/profile is sourced twice in one shell — e.g. .zshenv plus login .zprofile — ends up with the same profile listed under two spellings in GUIX_CODEGRAPH_PLUGINS)', () => {
+    const real = discoveryRoot(validBody, { nested: 'guix' });
+    const realEntry = path.join(real, 'guix', 'codegraph-plugin.cjs');
+
+    const aliasRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-plugin-discover-'));
+    dirs.push(aliasRoot);
+    fs.mkdirSync(path.join(aliasRoot, 'guix'), { recursive: true });
+    fs.symlinkSync(realEntry, path.join(aliasRoot, 'guix', 'codegraph-plugin.cjs'));
+
+    const specifiers = discoverPluginSpecifiers([real, aliasRoot]);
+    expect(specifiers).toHaveLength(1);
+    expect(() => loadEffectivePluginRegistry(real, [], [real, aliasRoot])).not.toThrow();
+  });
+
   it('loads a discovered plugin end-to-end via loadEffectivePluginRegistry', () => {
     const root = discoveryRoot(validBody, { nested: 'guix' });
     const registry = loadEffectivePluginRegistry(root, [], [root]);

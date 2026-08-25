@@ -171,6 +171,21 @@ const PLUGIN_ENTRY_FILENAME = 'codegraph-plugin.cjs';
  * scan must never turn "nothing installed" into an error. Returns absolute
  * paths, sorted and de-duplicated, so the resulting plugin set — and
  * therefore isIndexStale()'s fingerprint — never depends on readdir order.
+ *
+ * De-duplication follows realpath, not the literal directory string: it's
+ * routine for the SAME underlying store item to be reachable through two
+ * different GUIX_CODEGRAPH_PLUGINS entries at once — e.g. a shell that
+ * sources a Guix profile's `etc/profile` more than once (a `.zshenv`
+ * unconditional load plus a login `.zprofile`/`/etc/profile` load is
+ * standard `guix home` output) ends up with that profile's
+ * `share/codegraph-plugins` directory listed twice, once per literal
+ * spelling (resolved store-hash path vs. the `~/.guix-home/profile`
+ * symlink). Those are two paths to one file, not two competing packages —
+ * exactly how PATH/GUILE_LOAD_PATH/etc. already tolerate repeated
+ * directories from the same profile. Only the lexicographically-first
+ * literal path survives (keeps the result independent of directory order);
+ * a genuine same-name collision between two DIFFERENT files is left for
+ * loadEffectivePluginRegistry to reject.
  */
 export function discoverPluginSpecifiers(directories: readonly string[]): string[] {
   const found = new Set<string>();
@@ -188,7 +203,16 @@ export function discoverPluginSpecifiers(directories: readonly string[]): string
       }
     }
   }
-  return [...found].sort();
+  const seenRealPaths = new Set<string>();
+  const deduped: string[] = [];
+  for (const candidate of [...found].sort()) {
+    let real: string;
+    try { real = fs.realpathSync(candidate); } catch { real = candidate; }
+    if (seenRealPaths.has(real)) continue;
+    seenRealPaths.add(real);
+    deduped.push(candidate);
+  }
+  return deduped;
 }
 
 /** Split GUIX_CODEGRAPH_PLUGINS-style env values on path.delimiter, dropping blanks. */
