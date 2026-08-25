@@ -714,8 +714,9 @@ Re-index (`codegraph index`) after adding or changing mappings.
 
 ### Trusted plugins
 
-CodeGraph can load external languages and framework resolvers from explicitly
-listed project dependencies. It never auto-discovers local or global plugins:
+CodeGraph can load external languages and framework resolvers two ways: an
+explicit, project-scoped list in `codegraph.json`, and automatic discovery
+from your environment.
 
 ```json
 {
@@ -732,13 +733,39 @@ a `LanguageExtractor`. Import the public TypeScript contracts from
 `LanguageExtractor`). External languages always use the portable WASM path;
 they are never sent to the native kernel.
 
-Plugins are trusted code: their JavaScript executes without a sandbox in the
-CodeGraph main process and parse workers. Missing packages, incompatible API
-versions, invalid grammars, malformed extractors, duplicate ids, and extension
-collisions abort indexing with a configuration error. Only the project's
+#### Auto-discovery via `GUIX_CODEGRAPH_PLUGINS`
+
+Set `GUIX_CODEGRAPH_PLUGINS` to a `:`-separated (`;`-separated on Windows) list
+of directories, and CodeGraph looks in each one — and one level into its
+immediate subdirectories — for a file named `codegraph-plugin.cjs`. Every
+project on the machine picks these up automatically, with no per-project
+`codegraph.json` edit: this is how Guix's `native-search-paths` mechanism (the
+same pattern behind `GUILE_LOAD_PATH`, `PYTHONPATH`, `GUIX_PACKAGE_PATH`)
+shares a plugin across every project once both `codegraph` and a
+plugin-providing package (e.g. `codegraph-guile-plugin`) are installed in the
+same profile — no other packaging system or manual `export` is required, but
+either works the same way.
+
+A `codegraph.json` `plugins` entry always wins over an auto-discovered plugin
+at the same resolved path, and stays the fatal-on-error, explicitly reviewed
+mechanism it always was. Auto-discovered plugins are best-effort: one that
+fails to load is skipped with a warning rather than aborting indexing, since —
+unlike a `codegraph.json` entry — nobody reviewed it for this specific
+project.
+
+Plugins are trusted code regardless of how they were found: their JavaScript
+executes without a sandbox in the CodeGraph main process and parse workers.
+Installing a package that populates `GUIX_CODEGRAPH_PLUGINS` is the deliberate
+act of trust — the same trust already placed in every other package in that
+profile. Missing packages, incompatible API versions, invalid grammars,
+malformed extractors, and extension collisions abort indexing with a
+configuration error for explicit plugins; auto-discovered plugins degrade to
+a warning instead, except a name collision between two auto-discovered
+plugins (or one and an explicit entry), which stays fatal. Only the project's
 explicit `extensions` map may reassign an extension. Reopen the project after
-changing its plugin list; adding, removing, or upgrading a plugin marks the
-index stale and requires re-indexing.
+changing its plugin list or its `GUIX_CODEGRAPH_PLUGINS`; adding, removing, or
+upgrading any plugin — explicit or auto-discovered — marks the index stale
+and requires re-indexing.
 
 ## Telemetry
 

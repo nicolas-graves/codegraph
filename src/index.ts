@@ -61,7 +61,7 @@ import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegmen
 import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
 import { loadExtensionOverrides, loadPluginSpecifiers } from './project-config';
-import { loadPluginRegistry, PluginRegistry } from './plugins';
+import { loadEffectivePluginRegistry, PluginRegistry, resolveEnvPluginDirectories } from './plugins';
 
 // Re-export types for consumers
 export * from './types';
@@ -79,7 +79,7 @@ export {
 } from './directory';
 export { IndexProgress, IndexResult, SyncResult } from './extraction';
 export { detectLanguage, isLanguageSupported, isGrammarLoaded, getSupportedLanguages, initGrammars, loadGrammarsForLanguages, loadAllGrammars } from './extraction';
-export { PluginRegistry, PluginConfigurationError, loadPluginRegistry } from './plugins';
+export { PluginRegistry, PluginConfigurationError, loadPluginRegistry, loadEffectivePluginRegistry, discoverPluginSpecifiers, resolveEnvPluginDirectories } from './plugins';
 export type { CodeGraphPlugin, LanguagePlugin } from './plugins';
 export type { LanguageExtractor } from './extraction/tree-sitter-types';
 export { ResolutionResult } from './resolution';
@@ -175,7 +175,11 @@ export class CodeGraph {
     this.db = db;
     this.queries = queries;
     this.projectRoot = projectRoot;
-    this.pluginRegistry = loadPluginRegistry(projectRoot, loadPluginSpecifiers(projectRoot));
+    this.pluginRegistry = loadEffectivePluginRegistry(
+      projectRoot,
+      loadPluginSpecifiers(projectRoot),
+      resolveEnvPluginDirectories(process.env.GUIX_CODEGRAPH_PLUGINS)
+    );
     this.fileLock = new FileLock(
       path.join(getCodeGraphDir(projectRoot), 'codegraph.lock')
     );

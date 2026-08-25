@@ -154,3 +154,91 @@ export function loadPluginRegistry(projectRoot: string, specifiers: readonly str
   }
   return new PluginRegistry(loaded);
 }
+
+const PLUGIN_ENTRY_FILENAME = 'codegraph-plugin.cjs';
+
+/**
+ * Scan `directories` (already split from GUIX_CODEGRAPH_PLUGINS) for
+ * `codegraph-plugin.cjs` entry files, at most one level deep: a file directly
+ * inside a directory, or inside any of its immediate subdirectories — never
+ * deeper. This matches Guix's directory-type native-search-paths: each
+ * profile package contributes one shared directory name (e.g.
+ * `share/codegraph-plugins`), and a package nests its own plugin one level
+ * under it (e.g. `guix/codegraph-plugin.cjs`) so two unrelated packages
+ * sharing that directory name never collide on the entry filename.
+ *
+ * A missing, unreadable, or non-directory entry is silently skipped — this
+ * scan must never turn "nothing installed" into an error. Returns absolute
+ * paths, sorted and de-duplicated, so the resulting plugin set — and
+ * therefore isIndexStale()'s fingerprint — never depends on readdir order.
+ */
+export function discoverPluginSpecifiers(directories: readonly string[]): string[] {
+  const found = new Set<string>();
+  for (const dir of directories) {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch { continue; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isFile() && entry.name === PLUGIN_ENTRY_FILENAME) {
+        found.add(full);
+      } else if (entry.isDirectory()) {
+        const nested = path.join(full, PLUGIN_ENTRY_FILENAME);
+        if (fs.statSync(nested, { throwIfNoEntry: false })?.isFile()) found.add(nested);
+      }
+    }
+  }
+  return [...found].sort();
+}
+
+/** Split GUIX_CODEGRAPH_PLUGINS-style env values on path.delimiter, dropping blanks. */
+export function resolveEnvPluginDirectories(envVal: string | undefined): string[] {
+  return (envVal ?? '').split(path.delimiter).map((d) => d.trim()).filter(Boolean);
+}
+
+/**
+ * Build the effective plugin registry: explicit codegraph.json "plugins"
+ * (fatal on error, unchanged) plus codegraph-plugin.cjs files auto-discovered
+ * from `envDirectories` (GUIX_CODEGRAPH_PLUGINS — see README "Trusted
+ * plugins"). Precedence and de-dup:
+ *
+ *   1. Explicit specifiers always load, in declared order, fatal on error —
+ *      exactly as today.
+ *   2. An auto-discovered candidate whose resolved absolute path exactly
+ *      matches an already-explicit absolute-path specifier is dropped, not
+ *      re-loaded — keeps a codegraph.json that still hardcodes an old
+ *      plugin's store path from hitting PluginRegistry's "duplicate plugin
+ *      name" error during migration.
+ *   3. Remaining candidates are individually probe-loaded. One that fails to
+ *      load or validate is logged as a warning and skipped, NOT fatal —
+ *      unlike an explicit entry, nobody reviewed this file for this project.
+ *   4. Every candidate that validates is appended after the explicit
+ *      entries, in sorted-path order.
+ *
+ * A name collision between two ACCEPTED auto-discovered plugins (or one and
+ * an explicit entry) remains a fatal PluginConfigurationError from the final
+ * loadPluginRegistry call — there's no principled way to silently pick a
+ * winner between two independently-valid profile-installed packages.
+ */
+export function loadEffectivePluginRegistry(
+  projectRoot: string,
+  explicitSpecifiers: readonly string[],
+  envDirectories: readonly string[] = []
+): PluginRegistry {
+  const explicitResolved = new Set(
+    explicitSpecifiers.filter((s) => path.isAbsolute(s)).map((s) => path.resolve(s))
+  );
+  const candidates = discoverPluginSpecifiers(envDirectories)
+    .filter((c) => !explicitResolved.has(path.resolve(c)));
+
+  const accepted: string[] = [];
+  for (const candidate of candidates) {
+    try {
+      loadPluginRegistry(projectRoot, [candidate]); // probe only; require() cache makes the real load below free
+      accepted.push(candidate);
+    } catch (err) {
+      logWarn(`Ignoring auto-discovered CodeGraph plugin: ${err instanceof Error ? err.message : String(err)}`, { candidate });
+    }
+  }
+  return loadPluginRegistry(projectRoot, [...explicitSpecifiers, ...accepted]);
+}

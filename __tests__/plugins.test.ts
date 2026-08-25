@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { loadPluginRegistry, PluginConfigurationError } from '../src/plugins';
+import { discoverPluginSpecifiers, loadEffectivePluginRegistry, loadPluginRegistry, PluginConfigurationError } from '../src/plugins';
 import CodeGraph from '../src/index';
 
 const dirs: string[] = [];
@@ -58,6 +58,93 @@ describe('external plugin registry', () => {
     expect(rb.detectLanguage('x.scm')).toBeUndefined();
     expect(ra.extensionMap({ '.scm': 'javascript' })['.scm']).toBe('javascript');
     expect(ra.extensionMap({ '.foo': 'missing-language' })['.foo']).toBeUndefined();
+  });
+});
+
+describe('auto-discovered plugins (GUIX_CODEGRAPH_PLUGINS)', () => {
+  // A discovery-root directory, matching the layout GUIX_CODEGRAPH_PLUGINS
+  // entries actually have: either `codegraph-plugin.cjs` directly inside
+  // (flat), or nested one level under a named subdirectory (mirrors Guix's
+  // `share/codegraph-plugins/guix/codegraph-plugin.cjs`).
+  function discoveryRoot(body: string, opts: { nested?: string; grammar?: boolean } = {}): string {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-plugin-discover-'));
+    dirs.push(root);
+    const dir = opts.nested ? path.join(root, opts.nested) : root;
+    fs.mkdirSync(dir, { recursive: true });
+    if (opts.grammar !== false) fs.writeFileSync(path.join(dir, 'grammar.wasm'), 'wasm');
+    fs.writeFileSync(path.join(dir, 'codegraph-plugin.cjs'), body);
+    return root;
+  }
+
+  const validBody = `module.exports={apiVersion:1,name:'discovered',languages:[{id:'guix',extensions:['.gscm'],grammar:'./grammar.wasm',extractor:${extractor}}]}`;
+
+  it('is a no-op for a directory that does not exist', () => {
+    expect(discoverPluginSpecifiers(['/nonexistent/codegraph-plugin-dir'])).toEqual([]);
+  });
+
+  it('finds a plugin directly inside a discovery root (flat layout)', () => {
+    const root = discoveryRoot(validBody);
+    expect(discoverPluginSpecifiers([root])).toEqual([path.join(root, 'codegraph-plugin.cjs')]);
+  });
+
+  it('finds a plugin one level down but not two (nested layout, matching Guix share/codegraph-plugins/<name>/)', () => {
+    const root = discoveryRoot(validBody, { nested: 'guix' });
+    expect(discoverPluginSpecifiers([root])).toEqual([path.join(root, 'guix', 'codegraph-plugin.cjs')]);
+
+    const tooDeep = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-plugin-discover-'));
+    dirs.push(tooDeep);
+    fs.mkdirSync(path.join(tooDeep, 'a', 'b'), { recursive: true });
+    fs.writeFileSync(path.join(tooDeep, 'a', 'b', 'codegraph-plugin.cjs'), validBody);
+    expect(discoverPluginSpecifiers([tooDeep])).toEqual([]);
+  });
+
+  it('returns candidates sorted and de-duplicated regardless of directory order', () => {
+    const rootA = discoveryRoot(validBody, { nested: 'a-plugin' });
+    const rootB = discoveryRoot(validBody, { nested: 'b-plugin' });
+    const specifiers = discoverPluginSpecifiers([rootB, rootA]);
+    expect(specifiers).toEqual([...specifiers].sort());
+    expect(specifiers).toHaveLength(2);
+  });
+
+  it('loads a discovered plugin end-to-end via loadEffectivePluginRegistry', () => {
+    const root = discoveryRoot(validBody, { nested: 'guix' });
+    const registry = loadEffectivePluginRegistry(root, [], [root]);
+    expect(registry.detectLanguage('x.gscm')).toBe('guix');
+  });
+
+  it('an explicit codegraph.json entry at the same resolved path wins over discovery, without a duplicate-name error', () => {
+    const root = discoveryRoot(validBody, { nested: 'guix' });
+    const explicitPath = path.join(root, 'guix', 'codegraph-plugin.cjs');
+    expect(() => loadEffectivePluginRegistry(root, [explicitPath], [root])).not.toThrow();
+    const registry = loadEffectivePluginRegistry(root, [explicitPath], [root]);
+    expect(registry.plugins).toHaveLength(1);
+  });
+
+  it('a broken auto-discovered plugin is skipped with a warning, not fatal, and does not block a valid explicit plugin', () => {
+    const broken = discoveryRoot(`module.exports={apiVersion:2,name:'future'}`);
+    const explicitRoot = fixture(`module.exports={apiVersion:1,name:'explicit',languages:[{id:'scheme',extensions:['.scm'],grammar:'./grammar.wasm',extractor:${extractor}}]}`);
+    const registry = loadEffectivePluginRegistry(explicitRoot, ['./plugin.cjs'], [broken]);
+    expect(registry.detectLanguage('x.scm')).toBe('scheme');
+    expect(registry.plugins.map((p) => p.plugin.name)).toEqual(['explicit']);
+  });
+
+  it('two accepted auto-discovered plugins sharing a name still throws', () => {
+    const rootA = discoveryRoot(
+      `module.exports={apiVersion:1,name:'clash',languages:[{id:'guix',extensions:['.gscm'],grammar:'./grammar.wasm',extractor:${extractor}}]}`,
+      { nested: 'a' }
+    );
+    const rootB = discoveryRoot(
+      `module.exports={apiVersion:1,name:'clash',languages:[{id:'guile',extensions:['.gil'],grammar:'./grammar.wasm',extractor:${extractor}}]}`,
+      { nested: 'b' }
+    );
+    expect(() => loadEffectivePluginRegistry(rootA, [], [rootA, rootB])).toThrow(/duplicate plugin name/);
+  });
+
+  it('with no env directories, behaves identically to loadPluginRegistry (no auto-discovery is the zero-config default)', () => {
+    const root = fixture(`module.exports={apiVersion:1,name:'explicit-only',languages:[{id:'scheme',extensions:['.scm'],grammar:'./grammar.wasm',extractor:${extractor}}]}`);
+    const a = loadEffectivePluginRegistry(root, ['./plugin.cjs'], []);
+    const b = loadPluginRegistry(root, ['./plugin.cjs']);
+    expect(a.plugins.map((p) => p.plugin.name)).toEqual(b.plugins.map((p) => p.plugin.name));
   });
 });
 
@@ -133,6 +220,37 @@ describe('external plugin end-to-end indexing (#1552)', () => {
       expect(sync2.filesModified).toBe(0);
     } finally {
       cg.destroy();
+    }
+  });
+
+  it('indexes a plugin discovered purely via GUIX_CODEGRAPH_PLUGINS, with no codegraph.json plugins entry at all', async () => {
+    const discoveryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-plugin-envdisc-'));
+    dirs.push(discoveryDir);
+    const pluginDir = path.join(discoveryDir, 'guix');
+    fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(pluginDir, 'codegraph-plugin.cjs'),
+      `module.exports = { apiVersion: 1, name: 'py-plugin-env-test', languages: [{
+        id: 'pypluginenvtest', extensions: ['.pyplugenv'], grammar: ${JSON.stringify(pyWasm)},
+        extractor: ${pyExtractorLiteral},
+      }] };`
+    );
+
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-plugin-e2e-env-'));
+    dirs.push(root);
+    fs.writeFileSync(path.join(root, 'greet.pyplugenv'), `def greet(name):\n    return helper(name)\n\ndef helper(name):\n    return "hi " + name\n`);
+
+    const previous = process.env.GUIX_CODEGRAPH_PLUGINS;
+    process.env.GUIX_CODEGRAPH_PLUGINS = discoveryDir;
+    let cg: CodeGraph | undefined;
+    try {
+      cg = await CodeGraph.init(root, { index: true });
+      const found = cg.searchNodes('helper');
+      expect(found.some((r) => r.node.name === 'helper')).toBe(true);
+    } finally {
+      cg?.destroy();
+      if (previous === undefined) delete process.env.GUIX_CODEGRAPH_PLUGINS;
+      else process.env.GUIX_CODEGRAPH_PLUGINS = previous;
     }
   });
 });
