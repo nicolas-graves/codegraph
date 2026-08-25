@@ -212,33 +212,53 @@ export function resolveEnvPluginDirectories(envVal: string | undefined): string[
  *   3. Remaining candidates are individually probe-loaded. One that fails to
  *      load or validate is logged as a warning and skipped, NOT fatal —
  *      unlike an explicit entry, nobody reviewed this file for this project.
- *   4. Every candidate that validates is appended after the explicit
- *      entries, in sorted-path order.
+ *   4. A probed candidate whose declared plugin `name` matches an already
+ *      explicit plugin's name is ALSO dropped with a warning rather than
+ *      loaded — even at a different resolved path. This is the common
+ *      migration case: a project's codegraph.json still hardcodes an old
+ *      build's store path for the same logical plugin a Guix profile now
+ *      also provides via auto-discovery. Unlike two independently-valid
+ *      auto-discovered plugins colliding (no principled winner — stays
+ *      fatal below), an explicit codegraph.json entry IS the project's
+ *      already-stated choice, so the auto-discovered same-named plugin is
+ *      redundant, not a genuine conflict.
+ *   5. Every remaining candidate is appended after the explicit entries, in
+ *      sorted-path order.
  *
- * A name collision between two ACCEPTED auto-discovered plugins (or one and
- * an explicit entry) remains a fatal PluginConfigurationError from the final
- * loadPluginRegistry call — there's no principled way to silently pick a
- * winner between two independently-valid profile-installed packages.
+ * A name collision between two ACCEPTED auto-discovered plugins remains a
+ * fatal PluginConfigurationError from the final loadPluginRegistry call —
+ * there's no principled way to silently pick a winner between two
+ * independently-valid profile-installed packages.
  */
 export function loadEffectivePluginRegistry(
   projectRoot: string,
   explicitSpecifiers: readonly string[],
   envDirectories: readonly string[] = []
 ): PluginRegistry {
-  const explicitResolved = new Set(
+  const explicitRegistry = loadPluginRegistry(projectRoot, explicitSpecifiers); // fatal on error, unchanged
+  const explicitResolvedPaths = new Set(
     explicitSpecifiers.filter((s) => path.isAbsolute(s)).map((s) => path.resolve(s))
   );
+  const explicitNames = new Set(explicitRegistry.plugins.map((p) => p.plugin.name));
+
   const candidates = discoverPluginSpecifiers(envDirectories)
-    .filter((c) => !explicitResolved.has(path.resolve(c)));
+    .filter((c) => !explicitResolvedPaths.has(path.resolve(c)));
 
   const accepted: string[] = [];
   for (const candidate of candidates) {
+    let probed: PluginRegistry;
     try {
-      loadPluginRegistry(projectRoot, [candidate]); // probe only; require() cache makes the real load below free
-      accepted.push(candidate);
+      probed = loadPluginRegistry(projectRoot, [candidate]); // probe only; require() cache makes the real load below free
     } catch (err) {
       logWarn(`Ignoring auto-discovered CodeGraph plugin: ${err instanceof Error ? err.message : String(err)}`, { candidate });
+      continue;
     }
+    const name = probed.plugins[0]?.plugin.name;
+    if (name !== undefined && explicitNames.has(name)) {
+      logWarn(`Ignoring auto-discovered CodeGraph plugin "${name}": already loaded explicitly via codegraph.json`, { candidate });
+      continue;
+    }
+    accepted.push(candidate);
   }
   return loadPluginRegistry(projectRoot, [...explicitSpecifiers, ...accepted]);
 }

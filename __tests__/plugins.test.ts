@@ -120,6 +120,18 @@ describe('auto-discovered plugins (GUIX_CODEGRAPH_PLUGINS)', () => {
     expect(registry.plugins).toHaveLength(1);
   });
 
+  it('an explicit entry wins over a same-named auto-discovered plugin at a DIFFERENT path, without a duplicate-name error (regression: stale codegraph.json store path vs. a Guix-profile upgrade of the same plugin)', () => {
+    const explicitRoot = fixture(`module.exports={apiVersion:1,name:'@codegraph/tree-sitter-guix',languages:[{id:'guix',extensions:['.gscm'],grammar:'./grammar.wasm',extractor:${extractor}}]}`);
+    const stale = discoveryRoot(
+      `module.exports={apiVersion:1,name:'@codegraph/tree-sitter-guix',languages:[{id:'guile',extensions:['.gil'],grammar:'./grammar.wasm',extractor:${extractor}}]}`,
+      { nested: 'guix' }
+    );
+    const registry = loadEffectivePluginRegistry(explicitRoot, ['./plugin.cjs'], [stale]);
+    expect(registry.plugins).toHaveLength(1);
+    expect(registry.detectLanguage('x.gscm')).toBe('guix');
+    expect(registry.detectLanguage('x.gil')).toBeUndefined();
+  });
+
   it('a broken auto-discovered plugin is skipped with a warning, not fatal, and does not block a valid explicit plugin', () => {
     const broken = discoveryRoot(`module.exports={apiVersion:2,name:'future'}`);
     const explicitRoot = fixture(`module.exports={apiVersion:1,name:'explicit',languages:[{id:'scheme',extensions:['.scm'],grammar:'./grammar.wasm',extractor:${extractor}}]}`);

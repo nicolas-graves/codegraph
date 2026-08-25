@@ -747,9 +747,12 @@ same profile — no other packaging system or manual `export` is required, but
 either works the same way.
 
 A `codegraph.json` `plugins` entry always wins over an auto-discovered plugin
-at the same resolved path, and stays the fatal-on-error, explicitly reviewed
-mechanism it always was. Auto-discovered plugins are best-effort: one that
-fails to load is skipped with a warning rather than aborting indexing, since —
+at the same resolved path, or declaring the same plugin name at a different
+path (e.g. a stale store path still hardcoded in `codegraph.json` after a
+Guix profile upgrades the same plugin) — and stays the fatal-on-error,
+explicitly reviewed mechanism it always was. Auto-discovered plugins are
+best-effort: one that fails to load, or collides by name with an explicit
+entry, is skipped with a warning rather than aborting indexing, since —
 unlike a `codegraph.json` entry — nobody reviewed it for this specific
 project.
 
