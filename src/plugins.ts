@@ -195,9 +195,20 @@ export function discoverPluginSpecifiers(directories: readonly string[]): string
     catch { continue; }
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
-      if (entry.isFile() && entry.name === PLUGIN_ENTRY_FILENAME) {
+      let isFile = entry.isFile();
+      let isDirectory = entry.isDirectory();
+      if (entry.isSymbolicLink()) {
+        try {
+          const target = fs.statSync(full);
+          isFile = target.isFile();
+          isDirectory = target.isDirectory();
+        } catch {
+          continue; // broken symlink
+        }
+      }
+      if (isFile && entry.name === PLUGIN_ENTRY_FILENAME) {
         found.add(full);
-      } else if (entry.isDirectory()) {
+      } else if (isDirectory) {
         const nested = path.join(full, PLUGIN_ENTRY_FILENAME);
         if (fs.statSync(nested, { throwIfNoEntry: false })?.isFile()) found.add(nested);
       }

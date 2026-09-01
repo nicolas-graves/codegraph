@@ -98,6 +98,17 @@ describe('auto-discovered plugins (GUIX_CODEGRAPH_PLUGINS)', () => {
     expect(discoverPluginSpecifiers([tooDeep])).toEqual([]);
   });
 
+  it('finds a plugin through a symlinked subdirectory (multi-package Guix profile layout)', () => {
+    const storeRoot = discoveryRoot(validBody, { nested: 'guix' });
+    const profileRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-plugin-profile-'));
+    dirs.push(profileRoot);
+    fs.symlinkSync(path.join(storeRoot, 'guix'), path.join(profileRoot, 'guix'), 'dir');
+
+    expect(discoverPluginSpecifiers([profileRoot])).toEqual([
+      path.join(profileRoot, 'guix', 'codegraph-plugin.cjs'),
+    ]);
+  });
+
   it('returns candidates sorted and de-duplicated regardless of directory order', () => {
     const rootA = discoveryRoot(validBody, { nested: 'a-plugin' });
     const rootB = discoveryRoot(validBody, { nested: 'b-plugin' });
